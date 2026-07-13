@@ -1,0 +1,24 @@
+DISCORD_TOKEN=
+
+# ID de Discord del owner del bot (acceso a /lock, /farm y /assign)
+BOT_OWNER_ID=1240589249829404695
+
+# A quién se le manda el DM si desconectan/mueven al bot estando en lock o farm
+REPORT_OWNER_ID=1240589249829404695
+
+# Link que usa #join / /farm cuando no le pasas ninguno
+FARM_DEFAULT_URL=https://www.youtube.com/watch?v=GAJLwUt6RQQ
+
+# Cookies de YouTube exportadas en formato Netscape (login.info, SID, etc.).
+# NO pongas aquí un valor real de ejemplo/plantilla — pega tus propias cookies
+# solo en la variable de entorno de Railway, nunca en un archivo que subas a GitHub.
+YTDLP_COOKIES=
+
+# IDs de los emoji de aplicación (Developer Portal > Emoji) para los botones
+# del mensaje de reproducción. Si los dejas vacíos, los botones se quedan
+# solo con texto, sin ningún icono.
+ICON_PREVIOUS_ID=
+ICON_PAUSE_ID=
+ICON_PLAY_ID=
+ICON_NEXT_ID=
+ICON_STOP_ID=
