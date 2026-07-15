@@ -8,6 +8,8 @@ import yt_dlp
 from discord import app_commands
 from discord.ext import commands
 
+_cookies_env = os.environ.get("YTDLP_COOKIES")
+
 YDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -15,10 +17,13 @@ YDL_OPTS = {
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
     "socket_timeout": 10,
-    "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+    # android_vr no soporta cookies (yt-dlp lo salta y falla). Si hay cookies,
+    # usamos el cliente que yt-dlp recomienda para ese caso (tv_downgraded/web_safari).
+    "extractor_args": {
+        "youtube": {"player_client": ["tv_downgraded", "web_safari"] if _cookies_env else ["android_vr"]}
+    },
 }
 
-_cookies_env = os.environ.get("YTDLP_COOKIES")
 if _cookies_env:
     _cookies_path = "/tmp/cookies.txt"
     with open(_cookies_path, "w") as f:
