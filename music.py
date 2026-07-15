@@ -172,6 +172,8 @@ class GuildPlayer:
         self.locked: bool = False
         self.locked_channel_id: int | None = None
         self.locked_recovering: bool = False
+        self.loop_prep_task: asyncio.Task | None = None
+        self._next_loop_url: str | None = None
         self.loop_current: bool = False
         self.farm_channel_id: int | None = None
 
@@ -202,12 +204,40 @@ class GuildPlayer:
 
         self.voice_client.play(source, after=after, bitrate=384, signal_type="music")
         embed, view = self.build_now_playing(track)
-        try:
-            self.now_playing_message = await self.voice_client.channel.send(embed=embed, view=view)
-        except discord.HTTPException:
-            self.now_playing_message = None
+        edited = False
+        if self.now_playing_message is not None:
+            try:
+                self.now_playing_message = await self.now_playing_message.edit(embed=embed, view=view)
+                edited = True
+            except discord.HTTPException:
+                edited = False
+        if not edited:
+            try:
+                self.now_playing_message = await self.voice_client.channel.send(embed=embed, view=view)
+            except discord.HTTPException:
+                self.now_playing_message = None
         # (antes se lanzaba un progress_loop() para refrescar una barra de progreso en vivo;
         # ya no aplica porque el embed ahora solo muestra la duración total, no el progreso)
+
+        if self.loop_prep_task:
+            self.loop_prep_task.cancel()
+        self._next_loop_url = None
+        if self.loop_current:
+            self.loop_prep_task = asyncio.create_task(self._prepare_next_loop(track))
+
+    async def _prepare_next_loop(self, track: Track):
+        """En modo farm/loop: re-resuelve el link de audio 5 minutos antes de que
+        termine la canción, para que el siguiente ciclo empiece sin hueco de silencio."""
+        wait_seconds = max((track.duration or 0) - 300, 0)
+        try:
+            await asyncio.sleep(wait_seconds)
+            fresh = Track(track.title, track.webpage_url, track.thumbnail, track.duration, requester=track.requester, author=track.author)
+            await asyncio.to_thread(resolve_stream, fresh)
+            self._next_loop_url = fresh.stream_url
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._next_loop_url = None
 
     async def _on_track_end(self):
         if self.locked_recovering:
@@ -224,7 +254,10 @@ class GuildPlayer:
 
         if self.loop_current and self.current is not None:
             track = self.current
-            track.stream_url = None  # forzar re-resolución: el link de YouTube puede expirar tras horas
+            if self._next_loop_url:
+                track.stream_url = self._next_loop_url
+            else:
+                track.stream_url = None  # no se alcanzó a pre-resolver a tiempo; forzar re-resolución
             await self._start(track)
             return
 
@@ -266,6 +299,9 @@ class GuildPlayer:
         if self.idle_task:
             self.idle_task.cancel()
             self.idle_task = None
+        if self.loop_prep_task:
+            self.loop_prep_task.cancel()
+            self.loop_prep_task = None
         self.queue.clear()
         self.history.clear()
         self.current = None
@@ -465,6 +501,10 @@ class Music(commands.Cog):
     def _has_special_access(self, user_id: int, guild: discord.Guild) -> bool:
         return user_id == BOT_OWNER_ID or user_id == self.assigned_user_id or user_id == guild.owner_id
 
+    def _is_owner_only(self, user_id: int, guild: discord.Guild) -> bool:
+        """Más estricto que _has_special_access: NO incluye a la persona asignada con /assign."""
+        return user_id == BOT_OWNER_ID or user_id == guild.owner_id
+
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
         if member.id == self.bot.user.id:
@@ -482,7 +522,7 @@ class Music(commands.Cog):
             if not any(not m.bot for m in vc_channel.members):
                 player.start_idle_timer()
 
-    async def _find_recent_culprit(self, guild: discord.Guild, action, max_age_seconds: float = 15.0):
+    async def _find_recent_culprit(self, guild: discord.Guild, action, max_age_seconds: float = 45.0):
         """Busca en el audit log una entrada RECIENTE cuyo objetivo sea este bot. Devuelve None si no hay certeza."""
         try:
             async for entry in guild.audit_logs(limit=10, action=action):
@@ -505,7 +545,7 @@ class Music(commands.Cog):
         channel_name = channel.name if channel else "canal desconocido"
         mode_label = "🔒 lock" if mode == "lock" else "🌾 farm"
         if culprit is not None:
-            who = f"**{culprit}** (`{culprit.id}`)"
+            who = f"{culprit.mention} — **{culprit}** (`{culprit.id}`)"
         else:
             who = "No pude confirmar con certeza quién fue (sin permiso de ver audit log, o no hubo una entrada reciente que apuntara a mí)."
         embed = discord.Embed(
@@ -548,21 +588,13 @@ class Music(commands.Cog):
 
         player.locked_recovering = True
 
-        await asyncio.sleep(1.5)  # dar tiempo a que la entrada aparezca en el audit log
         action = discord.AuditLogAction.member_disconnect if after.channel is None else discord.AuditLogAction.member_move
-        culprit = await self._find_recent_culprit(guild, action)
-
-        reason_text = (
-            "Desconectó/movió al bot de música estando fijado (lock) a un canal."
-            if mode == "lock"
-            else "Desconectó/movió al bot de música estando en modo farm en un canal."
-        )
-
-        if culprit is not None:
-            try:
-                await guild.kick(culprit, reason=reason_text)
-            except discord.Forbidden:
-                pass
+        culprit = None
+        for intento in range(4):
+            await asyncio.sleep(1.5)  # dar tiempo a que la entrada aparezca en el audit log
+            culprit = await self._find_recent_culprit(guild, action)
+            if culprit is not None:
+                break
 
         await self._report_disconnect(guild, mode, protected_channel_id, culprit)
 
@@ -774,9 +806,9 @@ class Music(commands.Cog):
     @app_commands.command(name="farm", description="Reproduce en bucle infinito para quedarte en el canal (dueños/asignado)")
     @app_commands.describe(query="Link o nombre. Si no pones nada, usa FARM_DEFAULT_URL")
     async def farm_slash(self, interaction: discord.Interaction, query: str = None):
-        if not self._has_special_access(interaction.user.id, interaction.guild):
+        if not self._is_owner_only(interaction.user.id, interaction.guild):
             await interaction.response.send_message(
-                "❌ Solo el dueño del servidor, el owner del bot, o la persona asignada pueden usar este comando.",
+                "❌ Solo el dueño del servidor o el owner del bot pueden usar este comando.",
                 ephemeral=True,
             )
             return
